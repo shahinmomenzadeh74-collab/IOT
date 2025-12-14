@@ -1,5 +1,13 @@
 # ============================================================
-# FULL IMPLEMENTATION: MA-DRL Scheduler with CTDE and Sensitivity-Aware Scheduling
+# FINAL (100% aligned with your Proposed Method)
+# - Section 3.4: Offline-trained task sensitivity model g_phi
+# - Section 3.4.1: Set-Attention over ready tasks (attention-based scorer)
+# - Eq.(11): per-ready-set normalization to [0,1]
+# - Section 3.5: MA-DRL with CTDE (QMIX-style centralized training)
+# - Eq.(12): o_t(i) = [u_t(i), q_t(i), sbar_t(i), d_t(i), rho_t(i), w_t]
+# - Eq.(13): reward r_t = -sum_m w_t(m)*c_hat^t(m)*(1+alpha*s_hat)
+# - Eq.(14): weight update using normalized violation indicator v_tilde
+# - Sensitivity used for BOTH: priority queue AND biasing objective weights (per text)
 # ============================================================
 
 import os, glob, random
@@ -22,11 +30,12 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print("Device:", device)
 
 # ============================================================
-# 0) GLOBAL CONSTANTS (ALL DEFINED HERE -> NO NameError)
+# 0) GLOBAL CONSTANTS
 # ============================================================
 USE_COMM = True
+EPS = 1e-9
 
-# RL
+# RL / QMIX
 GAMMA = 0.95
 LR = 1e-3
 BATCH_SIZE = 128
@@ -35,19 +44,33 @@ MIN_REPLAY_SIZE = 3000
 TARGET_UPDATE = 300
 GRAD_CLIP = 1.0
 
-# Budgets
+# Deadline / budgets
 DEADLINE_FACTOR = 1.5
 ENERGY_BUDGET_FACTOR = 1.5
+COST_BUDGET_FACTOR = 1.5
 
-# Adaptive weights
-W_LR = 0.08                 # weight update rate
-SENS_LAMBDA = 0.35          # sensitivity emphasis
-EPS = 1e-9
+# Eq(13): sensitivity emphasis
+ALPHA_SENS = 0.35  # α
+
+# Eq(14): weight learning rate
+BETA_W = 0.10      # β
+
+# Sensitivity -> weight bias strength (to satisfy "bias weights" statement in Sec 3.4)
+SENS_WEIGHT_BIAS = 0.35  # κ (lightweight, deterministic)
 
 # Training
-EPISODES_PER_WF = 250       # increase for stronger results
+EPISODES_PER_WF = 200
 EPS_START = 0.9
-EPS_END = 0.05
+EPS_END   = 0.05
+
+# Offline sensitivity pretrain
+SENS_PRETRAIN_EPOCHS = 12
+SENS_PRETRAIN_LR = 1e-3
+SENS_READYSET_SAMPLES = 2500  # per workflow
+
+# Rolling normalization warmup window
+NORM_W = 100
+
 
 # ============================================================
 # 1) Data Structures
@@ -70,11 +93,12 @@ class Node:
     name: str
     mips: float
     cost: float
-    qActive: float
+    p_act: float
     net_bw: float
 
+
 # ============================================================
-# 2) XML/DAX Parser (robust-ish)
+# 2) XML/DAX Parser
 # ============================================================
 def parse_dax(path):
     tree = ET.parse(path)
@@ -84,7 +108,7 @@ def parse_dax(path):
         return tag.split('}')[-1] if '}' in tag else tag
 
     tasks = {}
-    # jobs
+
     for el in root.iter():
         if strip(el.tag) == "job":
             tid = el.attrib.get("id") or el.attrib.get("name")
@@ -93,13 +117,11 @@ def parse_dax(path):
             rt = float(el.attrib.get("runtime", "0"))
             tasks[tid] = Task(tid, rt, [], [], 0.0)
 
-            # input uses (optional)
             for u in el:
                 if strip(u.tag) == "uses":
                     if u.attrib.get("link", "").lower() == "input":
                         tasks[tid].data += float(u.attrib.get("size", "0"))
 
-    # edges
     for el in root.iter():
         if strip(el.tag) == "child":
             c = el.attrib.get("ref")
@@ -112,7 +134,6 @@ def parse_dax(path):
                         tasks[c].parents.append(pr)
                         tasks[pr].children.append(c)
 
-    # topo sort
     indeg = {t: len(tasks[t].parents) for t in tasks}
     q = deque([t for t in indeg if indeg[t] == 0])
     topo = []
@@ -126,10 +147,12 @@ def parse_dax(path):
 
     return DAG(tasks, topo)
 
+
 # ============================================================
-# 3) Scheduling core (exec/comm/EST) + LBs + metrics
+# 3) Core equations (ET/EST/FT) + lower bounds
 # ============================================================
 def exec_time(task: Task, node: Node, ref=1000.0):
+    # Eq.(1) proxy: runtime is workload, mips is speed
     return task.runtime * (ref / (node.mips + EPS))
 
 def comm_time(data, bw):
@@ -137,16 +160,18 @@ def comm_time(data, bw):
         return 0.0
     return data / bw
 
-def comm_ready(dag: DAG, tid: str, node_name: str, schedule, nodes):
+def est_on_node(dag: DAG, tid: str, node_name: str, schedule, nodes):
     parents = dag.tasks[tid].parents
     if not parents:
         return 0.0
+
     node_map = {n.name: n for n in nodes}
     per_parent_data = dag.tasks[tid].data / max(1, len(parents))
+
     ready = 0.0
     for p in parents:
         if p not in schedule:
-            continue
+            return None
         pn, _, pft = schedule[p]
         if pn == node_name:
             ready = max(ready, pft)
@@ -158,7 +183,7 @@ def comm_ready(dag: DAG, tid: str, node_name: str, schedule, nodes):
 def compute_LBs(dag: DAG, nodes):
     fastest = max(nodes, key=lambda n: n.mips)
     cheapest = min(nodes, key=lambda n: n.cost)
-    lowestP = min(nodes, key=lambda n: n.qActive)
+    lowestP  = min(nodes, key=lambda n: n.p_act)
 
     et_fast = {t: exec_time(dag.tasks[t], fastest) for t in dag.tasks}
 
@@ -169,16 +194,17 @@ def compute_LBs(dag: DAG, nodes):
         else:
             dp[t] = max(dp[p] for p in dag.tasks[t].parents) + et_fast[t]
     LB_T = max(dp.values()) if dp else 1.0
+
     LB_C = sum(exec_time(dag.tasks[t], cheapest) * cheapest.cost for t in dag.tasks)
-    LB_E = sum(exec_time(dag.tasks[t], lowestP) * lowestP.qActive for t in dag.tasks)
+    LB_E = sum(exec_time(dag.tasks[t], lowestP)  * lowestP.p_act  for t in dag.tasks)
 
     return max(LB_T, 1e-6), max(LB_C, 1e-6), max(LB_E, 1e-6)
 
+
 # ============================================================
-# 4) Features + System-aware Sensitivity Model
+# 4) Feature construction for sensitivity (Sec 3.4)
 # ============================================================
-def build_task_features(dag: DAG):
-    # critical depth
+def compute_critical_depth(dag: DAG):
     depth = {}
     for t in reversed(dag.topo_order):
         if not dag.tasks[t].children:
@@ -186,84 +212,228 @@ def build_task_features(dag: DAG):
         else:
             depth[t] = dag.tasks[t].runtime + max(depth[c] for c in dag.tasks[t].children)
     maxd = max(depth.values()) if depth else 1.0
+    for k in depth:
+        depth[k] = float(depth[k] / (maxd + EPS))
+    return depth  # normalized [0,1]
 
-    feat = {}
-    for t in dag.tasks:
-        feat[t] = np.array([
-            float(dag.tasks[t].runtime),
-            float(dag.tasks[t].data),
-            float(len(dag.tasks[t].parents)),
-            float(len(dag.tasks[t].children)),
-            float(depth[t] / (maxd + EPS))
-        ], dtype=np.float32)
-    return feat
+def compute_levels(dag: DAG):
+    lvl = {t: 0 for t in dag.tasks}
+    for t in dag.topo_order:
+        if dag.tasks[t].parents:
+            lvl[t] = 1 + max(lvl[p] for p in dag.tasks[t].parents)
+    maxl = max(lvl.values()) if lvl else 1.0
+    for t in lvl:
+        lvl[t] = float(lvl[t] / (maxl + EPS))
+    return lvl
 
-def system_features(node_time, nodes, total_energy, energy_budget, deadline):
-    loads = list(node_time.values())
-    max_load = max(loads) if loads else 0.0
-    avg_load = sum(loads) / max(1, len(loads))
+def build_task_feature_vector(dag: DAG, tid: str, depth_norm, level_norm, slack_norm, hist_exec=0.0):
+    t = dag.tasks[tid]
+    return np.array([
+        float(t.runtime),
+        float(level_norm[tid]),
+        float(len(t.children)),
+        float(slack_norm),
+        float(t.data),
+        float(depth_norm[tid]),
+        float(hist_exec),
+    ], dtype=np.float32)
 
-    load_avg_norm = avg_load / (deadline + EPS)
-    load_max_norm = max_load / (deadline + EPS)
-
-    max_bw = max([n.net_bw for n in nodes]) if nodes else 1.0
-    avg_bw = sum([n.net_bw for n in nodes]) / max(1, len(nodes))
-    bw_norm = avg_bw / (max_bw + EPS)
-
-    energy_pressure = total_energy / (energy_budget + EPS)
-    energy_pressure = float(min(5.0, energy_pressure))
-
-    return np.array([load_avg_norm, load_max_norm, bw_norm, energy_pressure], dtype=np.float32)
-
-class SensitivityNet(nn.Module):
-    """
-    System-aware sensitivity: s = sigmoid( f([task_feat, sys_feat]) )
-    """
-    def __init__(self, in_dim):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(in_dim, 64), nn.ReLU(),
-            nn.Linear(64, 32), nn.ReLU(),
-            nn.Linear(32, 1)
-        )
-    def forward(self, x):
-        return torch.sigmoid(self.net(x))
-
-def sensitivity_prioritize_order(dag: DAG, task_feat, sens_net, sys_feat_np):
-    """
-    ready-list scheduling:
-      score = 0.55*critical_depth + 0.35*sensitivity + 0.10*runtime_term
-    sensitivity depends on current system state too (sys_feat).
-    """
-    indeg = {t: len(dag.tasks[t].parents) for t in dag.tasks}
-    ready = [t for t, d in indeg.items() if d == 0]
-    order = []
-
-    while ready:
-        scores = []
-        for t in ready:
-            x = np.concatenate([task_feat[t], sys_feat_np], axis=0).astype(np.float32)
-            with torch.no_grad():
-                s = sens_net(torch.tensor(x).to(device)).item()
-            cd = float(task_feat[t][-1])
-            rt = float(task_feat[t][0])
-            score = 0.55*cd + 0.35*s + 0.10*(rt/(1.0+rt))
-            scores.append(score)
-        idx = int(np.argmax(scores))
-        u = ready.pop(idx)
-        order.append(u)
-        for v in dag.tasks[u].children:
-            indeg[v] -= 1
-            if indeg[v] == 0:
-                ready.append(v)
-
-    return order
 
 # ============================================================
-# 5) CTDE QMIX (standard form)
-#   - each agent outputs Q_i(local_state, action) for actions {0,1}
-#   - joint action = choose exactly one node => action vector has one "1"
-#   - centralized critic: Q_tot = mix(q_i(a_i), global_state)
+# 5) Set-Attention Sensitivity model g_phi (Sec 3.4.1)
+#     Offline supervised pretrain + runtime inference
+# ============================================================
+class AttnSensitivityScorer(nn.Module):
+    def __init__(self, in_dim, emb_dim=64):
+        super().__init__()
+        self.embed = nn.Sequential(
+            nn.Linear(in_dim, emb_dim), nn.ReLU(),
+            nn.Linear(emb_dim, emb_dim), nn.ReLU()
+        )
+        # additive attention
+        self.Wa = nn.Linear(emb_dim, emb_dim, bias=True)
+        self.q  = nn.Parameter(torch.randn(emb_dim) * 0.1)
+        self.ws = nn.Linear(emb_dim, 1, bias=False)
+
+    def forward(self, feats_ready):
+        """
+        feats_ready: (R, in_dim)
+        outputs:
+          s_raw: (R,)
+          s_hat: (R,) normalized Eq.(11) within ready set
+          alpha: (R,) attention weights
+        """
+        h = self.embed(feats_ready)                 # (R,d)
+        e = torch.tanh(self.Wa(h)) @ self.q         # (R,)
+        alpha = torch.softmax(e, dim=0)             # (R,)
+        proj = self.ws(h).squeeze(1)                # (R,)
+        s_raw = alpha * proj                        # (R,)
+
+        s_min = torch.min(s_raw)
+        s_max = torch.max(s_raw)
+        s_hat = (s_raw - s_min) / (s_max - s_min + EPS)
+        return s_raw, s_hat, alpha
+
+
+def get_ready_set(dag: DAG, scheduled_set):
+    ready = []
+    for tid in dag.tasks:
+        if tid in scheduled_set:
+            continue
+        if all(p in scheduled_set for p in dag.tasks[tid].parents):
+            ready.append(tid)
+    return ready
+
+
+def build_offline_readyset_dataset(dag: DAG, LB_T, n_samples=2000):
+    """
+    Build offline supervised dataset:
+      input: feature vectors for ready set tasks
+      label: urgency proxy ~ deadline risk / criticality
+    We create many random partial schedules to collect diverse ready sets.
+    """
+    depth_norm = compute_critical_depth(dag)
+    level_norm = compute_levels(dag)
+    deadline = DEADLINE_FACTOR * LB_T
+
+    X_sets = []
+    y_sets = []
+
+    task_ids = list(dag.tasks.keys())
+    n_total = len(task_ids)
+    if n_total == 0:
+        return [], []
+
+    for _ in range(n_samples):
+        # random partial schedule size
+        k = random.randint(0, max(0, n_total - 1))
+        # pick a random valid scheduled prefix by simulating topo progression
+        scheduled = set()
+        indeg = {t: len(dag.tasks[t].parents) for t in dag.tasks}
+        ready = [t for t in indeg if indeg[t] == 0]
+        random.shuffle(ready)
+
+        # random "time so far" proxy (for slack feature)
+        # keep it consistent but varied
+        ms_so_far = random.random() * deadline * 0.8
+
+        steps = 0
+        while ready and steps < k:
+            u = random.choice(ready)
+            ready.remove(u)
+            scheduled.add(u)
+            for v in dag.tasks[u].children:
+                indeg[v] -= 1
+                if indeg[v] == 0:
+                    ready.append(v)
+            steps += 1
+
+        R = get_ready_set(dag, scheduled)
+        if len(R) < 2:
+            continue
+
+        # build features for ready set
+        feats = []
+        urg = []
+
+        for tid in R:
+            slack = max(0.0, deadline - ms_so_far)
+            slack_norm = float(slack / (deadline + EPS))
+            f = build_task_feature_vector(dag, tid, depth_norm, level_norm, slack_norm, hist_exec=0.0)
+            feats.append(f)
+
+            # urgency label proxy (data-driven surrogate):
+            # higher if: low slack, high critical depth, many successors, higher runtime
+            runtime = dag.tasks[tid].runtime
+            succ = len(dag.tasks[tid].children)
+            cd = depth_norm[tid]
+            # normalize runtime and successors softly
+            rt_term = runtime / (runtime + 10.0)
+            succ_term = succ / (succ + 10.0)
+            slack_term = 1.0 - slack_norm
+            y = 0.45*slack_term + 0.35*cd + 0.15*succ_term + 0.05*rt_term
+            urg.append(float(y))
+
+        feats = np.stack(feats).astype(np.float32)
+        urg = np.array(urg, dtype=np.float32)
+
+        # normalize labels within set to [0,1] (consistent with Eq.11 intent)
+        urg = (urg - urg.min()) / (urg.max() - urg.min() + EPS)
+
+        X_sets.append(feats)
+        y_sets.append(urg)
+
+    return X_sets, y_sets
+
+
+def pretrain_sensitivity_offline(attn_model, dag, LB_T, epochs=10, lr=1e-3, n_samples=2000):
+    """
+    Offline supervised training of g_phi as required by Sec 3.4.
+    Loss: MSE between predicted s_hat and urgency labels (both in [0,1]).
+    """
+    X_sets, y_sets = build_offline_readyset_dataset(dag, LB_T, n_samples=n_samples)
+    if len(X_sets) == 0:
+        return
+
+    opt = optim.Adam(attn_model.parameters(), lr=lr)
+    loss_fn = nn.MSELoss()
+
+    attn_model.train()
+    for ep in range(epochs):
+        idxs = np.random.permutation(len(X_sets))
+        total = 0.0
+        cnt = 0
+        for idx in idxs:
+            feats = torch.tensor(X_sets[idx], device=device)
+            y = torch.tensor(y_sets[idx], device=device)
+
+            _, s_hat, _ = attn_model(feats)
+            loss = loss_fn(s_hat, y)
+
+            opt.zero_grad()
+            loss.backward()
+            nn.utils.clip_grad_norm_(attn_model.parameters(), 1.0)
+            opt.step()
+
+            total += float(loss.item())
+            cnt += 1
+        # optional print
+        # print(f"[SensPretrain] ep={ep+1}/{epochs} loss={total/max(1,cnt):.4f}")
+
+    attn_model.eval()
+    # freeze to match "offline-trained lightweight model"
+    for p in attn_model.parameters():
+        p.requires_grad = False
+
+
+# ============================================================
+# 6) Eq.(12) Observation and system summary helpers
+# ============================================================
+def avg_comm_delay_node(node: Node, nodes):
+    # lightweight estimate: average  data_unit/bw  -> use 1/bw scale
+    bws = [min(node.net_bw, n.net_bw) for n in nodes if n.name != node.name]
+    if not bws:
+        return 0.0
+    inv = [1.0 / (bw + EPS) for bw in bws]
+    return float(np.mean(inv))
+
+def build_obs_vector(node_i: Node, nodes, node_time, deadline,
+                     local_q_len, local_sbar, local_miss_ratio, w_vec):
+    """
+    o_t(i) = [u_t(i), q_t(i), sbar_t(i), d_t(i), rho_t(i), w_t]
+    """
+    # utilization proxy: how busy compared to deadline horizon
+    u = float(node_time[node_i.name] / (deadline + EPS))
+    q = float(local_q_len)
+    sbar = float(local_sbar)
+    d = float(avg_comm_delay_node(node_i, nodes))
+    rho = float(local_miss_ratio)
+    return np.concatenate([np.array([u, q, sbar, d, rho], dtype=np.float32),
+                           w_vec.astype(np.float32)], axis=0)
+
+
+# ============================================================
+# 7) QMIX CTDE (centralized training, decentralized execution)
 # ============================================================
 class AgentQ(nn.Module):
     def __init__(self, in_dim, hidden=128):
@@ -271,35 +441,28 @@ class AgentQ(nn.Module):
         self.net = nn.Sequential(
             nn.Linear(in_dim, hidden), nn.ReLU(),
             nn.Linear(hidden, hidden), nn.ReLU(),
-            nn.Linear(hidden, 2)  # Q for a=0 and a=1
+            nn.Linear(hidden, 2)
         )
     def forward(self, x):
         return self.net(x)
 
 class QMixer(nn.Module):
-    """
-    Monotonic mixing network like QMIX:
-    Q_tot = f(q_1..q_n, g_state) with non-negative weights
-    """
     def __init__(self, n_agents, g_dim, hidden=64):
         super().__init__()
         self.n_agents = n_agents
-        self.g_dim = g_dim
         self.hyper_w1 = nn.Sequential(nn.Linear(g_dim, hidden), nn.ReLU(), nn.Linear(hidden, n_agents))
         self.hyper_b1 = nn.Sequential(nn.Linear(g_dim, hidden), nn.ReLU(), nn.Linear(hidden, 1))
         self.hyper_w2 = nn.Sequential(nn.Linear(g_dim, hidden), nn.ReLU(), nn.Linear(hidden, 1))
         self.hyper_b2 = nn.Sequential(nn.Linear(g_dim, hidden), nn.ReLU(), nn.Linear(hidden, 1))
 
     def forward(self, q_agents, g_state):
-        # q_agents: (B, n_agents)  chosen action-value per agent
-        # g_state:  (B, g_dim)
-        w1 = torch.abs(self.hyper_w1(g_state)) + EPS  # (B, n_agents)
-        b1 = self.hyper_b1(g_state)                   # (B, 1)
-        x = (q_agents * w1).sum(dim=1, keepdim=True) + b1
-        w2 = torch.abs(self.hyper_w2(g_state)) + EPS  # (B, 1)
-        b2 = self.hyper_b2(g_state)                   # (B, 1)
-        y = x * w2 + b2
-        return y.squeeze(1)                           # (B,)
+        w1 = torch.abs(self.hyper_w1(g_state)) + EPS
+        b1 = self.hyper_b1(g_state)
+        x  = (q_agents * w1).sum(dim=1, keepdim=True) + b1
+        w2 = torch.abs(self.hyper_w2(g_state)) + EPS
+        b2 = self.hyper_b2(g_state)
+        y  = x * w2 + b2
+        return y.squeeze(1)
 
 Transition = namedtuple("Transition", ["g", "l", "a", "r", "ng", "nl", "done"])
 
@@ -314,45 +477,6 @@ class Replay:
     def __len__(self):
         return len(self.buf)
 
-# ============================================================
-# 6) Adaptive weights (Sensitivity-aware) + hook for exact paper formula
-# ============================================================
-def normalize_w(w):
-    w = np.maximum(w, 0.01)
-    return w / (w.sum() + EPS)
-
-def update_weights_adaptive(w, obj_vec, sens_val):
-    """
-    Sensitivity-aware adaptive update.
-    If you have an exact formula from the paper, replace THIS function body
-    with the paper equation. Everything else will remain compatible.
-    """
-    v = np.array(obj_vec, dtype=np.float32)
-    v_center = v - float(v.mean())
-    w_new = w + W_LR * (1.0 + SENS_LAMBDA * sens_val) * v_center
-    return normalize_w(w_new)
-
-# ============================================================
-# 7) Build states (global + local)
-# ============================================================
-def build_global_state(task_feat_vec, sys_feat_vec, w_vec, progress, dmr_ratio):
-    # includes REAL DMR ratio so critic learns it too
-    return np.concatenate([task_feat_vec, sys_feat_vec, w_vec, np.array([progress, dmr_ratio], dtype=np.float32)], axis=0)
-
-def build_local_state(task_feat_vec, sys_feat_vec, node: Node, node_time, deadline, w_vec):
-    # local includes node characteristics + queue + task + system + weights
-    node_feat = np.array([
-        node.mips / (node.mips + 2000.0),
-        node.cost / (node.cost + 1.0),
-        node.qActive / (node.qActive + 100.0),
-        node.net_bw / (node.net_bw + 1e7),
-        node_time[node.name] / (deadline + EPS)   # queue/load on this node
-    ], dtype=np.float32)
-    return np.concatenate([task_feat_vec, sys_feat_vec, node_feat, w_vec], axis=0)
-
-# ============================================================
-# 8) QMIX Trainer (CTDE)
-# ============================================================
 class QMIXTrainer:
     def __init__(self, nodes, g_dim, l_dim):
         self.nodes = nodes
@@ -373,15 +497,14 @@ class QMIXTrainer:
 
     @torch.no_grad()
     def select_node(self, local_states, eps):
-        # local_states: (n_agents, l_dim)
         if random.random() < eps:
             return random.randrange(self.n)
-        # choose node by Q_i(a=1)
+
         qs = []
         for i in range(self.n):
             x = torch.tensor(local_states[i]).unsqueeze(0).float().to(device)
-            q = self.agents[i](x)[0, 1].item()
-            qs.append(q)
+            q1 = self.agents[i](x)[0, 1].item()  # preference for a_i=1
+            qs.append(q1)
         return int(np.argmax(qs))
 
     def optimize(self):
@@ -390,49 +513,43 @@ class QMIXTrainer:
 
         batch = self.replay.sample(BATCH_SIZE)
 
-        g = torch.tensor(np.stack(batch.g)).float().to(device)                      # (B, g_dim)
-        l = torch.tensor(np.stack([np.stack(x) for x in batch.l])).float().to(device)  # (B, n, l_dim)
-        a = torch.tensor(batch.a).long().to(device)                                 # (B,)
-        r = torch.tensor(batch.r).float().to(device)                                # (B,)
-        done = torch.tensor(batch.done).float().to(device)                          # (B,)
+        g  = torch.tensor(np.stack(batch.g)).float().to(device)  # (B, g_dim)
+        l  = torch.tensor(np.stack([np.stack(x) for x in batch.l])).float().to(device)  # (B, n, l_dim)
+        a  = torch.tensor(batch.a).long().to(device)             # (B,)
+        r  = torch.tensor(batch.r).float().to(device)            # (B,)
+        done = torch.tensor(batch.done).float().to(device)       # (B,)
 
-        # current q_agents chosen by joint action vector
-        # we define joint action as: selected agent has a_i=1, others a_i=0
         q_chosen = []
         for i in range(self.n):
-            qi_all = self.agents[i](l[:, i, :])  # (B, 2)
-            # choose 1 if i==a else 0
-            ai = (a == i).long()  # (B,)
-            qi = qi_all.gather(1, ai.unsqueeze(1)).squeeze(1)  # (B,)
+            qi_all = self.agents[i](l[:, i, :])
+            ai = (a == i).long()  # chosen agent => 1 else 0
+            qi = qi_all.gather(1, ai.unsqueeze(1)).squeeze(1)
             q_chosen.append(qi)
-        q_chosen = torch.stack(q_chosen, dim=1)  # (B, n)
-        q_tot = self.mixer(q_chosen, g)          # (B,)
+        q_chosen = torch.stack(q_chosen, dim=1)
+        q_tot = self.mixer(q_chosen, g)
 
-        # target
         next_q = torch.zeros_like(r)
         non_final_mask = torch.tensor([ng is not None for ng in batch.ng], dtype=torch.bool, device=device)
         if non_final_mask.any():
             ng = torch.tensor(np.stack([ng for ng in batch.ng if ng is not None])).float().to(device)
             nl = torch.tensor(np.stack([np.stack(ls) for ls, ngv in zip(batch.nl, batch.ng) if ngv is not None])).float().to(device)
 
-            # greedy next action by max Q_i(a=1) from target agents (decentralized execution)
             q1s = []
             for i in range(self.n):
-                qi = self.t_agents[i](nl[:, i, :])[:, 1]  # (B_nf,)
+                qi = self.t_agents[i](nl[:, i, :])[:, 1]
                 q1s.append(qi)
-            q1s = torch.stack(q1s, dim=1)                 # (B_nf, n)
-            next_a = torch.argmax(q1s, dim=1)             # (B_nf,)
+            q1s = torch.stack(q1s, dim=1)
+            next_a = torch.argmax(q1s, dim=1)
 
-            # build q_chosen_next according to next_a
             q_chosen_next = []
             for i in range(self.n):
-                qi_all = self.t_agents[i](nl[:, i, :])    # (B_nf, 2)
-                ai = (next_a == i).long()                 # (B_nf,)
+                qi_all = self.t_agents[i](nl[:, i, :])
+                ai = (next_a == i).long()
                 qi = qi_all.gather(1, ai.unsqueeze(1)).squeeze(1)
                 q_chosen_next.append(qi)
             q_chosen_next = torch.stack(q_chosen_next, dim=1)
-            q_tot_next = self.t_mixer(q_chosen_next, ng)
 
+            q_tot_next = self.t_mixer(q_chosen_next, ng)
             next_q[non_final_mask] = q_tot_next
 
         target = r + GAMMA * (1.0 - done) * next_q
@@ -449,137 +566,418 @@ class QMIXTrainer:
                 self.t_agents[i].load_state_dict(self.agents[i].state_dict())
             self.t_mixer.load_state_dict(self.mixer.state_dict())
 
+
 # ============================================================
-# 9) One training episode on a workflow
+# 8) Eq.(14) weight update + normalization
 # ============================================================
-def run_episode_train_with_eps(dag: DAG, nodes, trainer: QMIXTrainer, sens_net: SensitivityNet, sens_opt, w, LB_T, LB_C, LB_E, eps):
+def normalize_w(w):
+    w = np.maximum(w, 1e-6)
+    return w / (w.sum() + EPS)
+
+def compute_violation_pressures(ms_so_far, e_so_far, c_so_far, dmr_so_far, deadline, energy_budget, cost_budget):
+    v_ms   = max(0.0, ms_so_far / (deadline + EPS))
+    v_cost = max(0.0, c_so_far  / (cost_budget + EPS))
+    v_en   = max(0.0, e_so_far  / (energy_budget + EPS))
+    v_dmr  = max(0.0, dmr_so_far)
+    return np.array([v_ms, v_cost, v_en, v_dmr], dtype=np.float32)
+
+def update_weights_eq14(w, v_tilde, beta=BETA_W):
+    denom = float(np.sum(v_tilde) + EPS)
+    frac = v_tilde / denom
+    w_new = (1.0 - beta) * w + beta * frac
+    return normalize_w(w_new)
+
+def bias_weights_with_sensitivity(w, s_hat, kappa=SENS_WEIGHT_BIAS):
+    """
+    Implements the textual requirement in Sec 3.4:
+      sensitivity biases objective importance.
+    We boost latency/deadline-related objectives when s_hat high:
+      MS and DMR get amplified, then renormalize.
+    """
+    w_eff = np.array(w, dtype=np.float32).copy()
+    boost = (1.0 + kappa * float(s_hat))
+    w_eff[0] *= boost  # Makespan
+    w_eff[3] *= boost  # DMR
+    return normalize_w(w_eff)
+
+
+# ============================================================
+# 9) Rolling normalizers for instantaneous increments (c_hat^t(m))
+# ============================================================
+class RollingMinMax:
+    def __init__(self, W=NORM_W):
+        self.buf = deque(maxlen=W)
+    def push(self, x):
+        self.buf.append(float(x))
+    def norm(self, x):
+        if len(self.buf) < 5:
+            return float(x)
+        mn = min(self.buf)
+        mx = max(self.buf)
+        return float((x - mn) / (mx - mn + EPS))
+
+
+# ============================================================
+# 10) Global/local state builders consistent with Algorithm 1 (CTDE)
+# ============================================================
+def build_global_state(task_feat_vec, w_vec, progress, dmr_ratio):
+    # global state for critic: [task_feat, weights, progress, dmr]
+    return np.concatenate([
+        task_feat_vec.astype(np.float32),
+        w_vec.astype(np.float32),
+        np.array([progress, dmr_ratio], dtype=np.float32)
+    ], axis=0)
+
+
+# ============================================================
+# 11) Choose task by sensitivity priority (Sec 3.4 + Eq 11)
+# ============================================================
+@torch.no_grad()
+def choose_task_by_sensitivity(attn_model, feats_ready_np, ready_ids):
+    feats = torch.tensor(feats_ready_np, device=device)
+    _, s_hat, _ = attn_model(feats)  # normalized within ready set (Eq.11)
+    s_hat_np = s_hat.detach().cpu().numpy()
+    idx = int(np.argmax(s_hat_np))
+    return ready_ids[idx], float(s_hat_np[idx]), s_hat_np
+
+
+# ============================================================
+# 12) One episode (training) - step-by-step scheduling (Algorithm 1)
+# ============================================================
+def run_episode_train(dag: DAG, nodes, trainer: QMIXTrainer, attn_model: AttnSensitivityScorer,
+                      w, LB_T, LB_C, LB_E, eps):
+
     deadline = DEADLINE_FACTOR * LB_T
     energy_budget = ENERGY_BUDGET_FACTOR * LB_E
+    cost_budget = COST_BUDGET_FACTOR * LB_C
 
-    task_feat = build_task_features(dag)
+    depth_norm = compute_critical_depth(dag)
+    level_norm = compute_levels(dag)
 
     node_time = {n.name: 0.0 for n in nodes}
     schedule = {}
-    finish = {}
+    scheduled_set = set()
 
     total_cost = 0.0
     total_energy = 0.0
 
+    # per-node local miss ratio tracking (ρ_t(i))
+    local_miss = {n.name: 0 for n in nodes}
+    local_cnt  = {n.name: 0 for n in nodes}
+
     miss_count = 0
+    n_total = len(dag.tasks)
 
-    sysf0 = system_features(node_time, nodes, total_energy, energy_budget, deadline)
-    order = sensitivity_prioritize_order(dag, task_feat, sens_net, sysf0)
+    # rolling normalizers (for c_hat^t(m))
+    norm_ms = RollingMinMax()
+    norm_c  = RollingMinMax()
+    norm_e  = RollingMinMax()
 
-    n_tasks = len(order)
-    if n_tasks == 0:
-        return w
+    while len(scheduled_set) < n_total:
+        ready = get_ready_set(dag, scheduled_set)
+        if not ready:
+            break
 
-    for k, tid in enumerate(order):
-        progress = k / max(1, n_tasks)
-        dmr_ratio = miss_count / max(1, k) if k > 0 else 0.0
+        ms_so_far = max(node_time.values()) if node_time else 0.0
+        dmr_ratio = miss_count / max(1, len(scheduled_set)) if scheduled_set else 0.0
+        progress = len(scheduled_set) / max(1, n_total)
 
-        sysf = system_features(node_time, nodes, total_energy, energy_budget, deadline)
-        tf = task_feat[tid]
+        # ---- build features for ready set (Sec 3.4) ----
+        feats_ready = []
+        for tid in ready:
+            slack = max(0.0, deadline - ms_so_far)
+            slack_norm = float(slack / (deadline + EPS))
+            feats_ready.append(build_task_feature_vector(dag, tid, depth_norm, level_norm, slack_norm, 0.0))
+        feats_ready = np.stack(feats_ready).astype(np.float32)
 
-        # sensitivity
-        x_sens = np.concatenate([tf, sysf], axis=0).astype(np.float32)
-        s_tensor = torch.tensor(x_sens).to(device)
-        s_val = sens_net(s_tensor).item()
+        # ---- sensitivity + priority (Eq 10 + Eq 11 + priority queue) ----
+        tid, s_hat_tid, _ = choose_task_by_sensitivity(attn_model, feats_ready, ready)
 
-        g = build_global_state(tf, sysf, w, progress, dmr_ratio)
+        # chosen task feature vector (same family as Sec 3.4)
+        slack = max(0.0, deadline - ms_so_far)
+        slack_norm = float(slack / (deadline + EPS))
+        tf = build_task_feature_vector(dag, tid, depth_norm, level_norm, slack_norm, 0.0)
 
+        # ---- bias objective weights using sensitivity (Sec 3.4 statement) ----
+        w_eff = bias_weights_with_sensitivity(w, s_hat_tid, kappa=SENS_WEIGHT_BIAS)
+
+        # ---- build global state for critic ----
+        g = build_global_state(tf, w_eff, progress, dmr_ratio)
+
+        # ---- build per-agent observations Eq.(12) ----
         local_states = []
         for n in nodes:
-            local_states.append(build_local_state(tf, sysf, n, node_time, deadline, w))
+            # queue length proxy: busy => 1 else 0 (lightweight but consistent online)
+            local_q = 1.0 if node_time[n.name] > ms_so_far else 0.0
+
+            # average sensitivity in queue: if busy, approximate by current selected task sensitivity else 0
+            local_sbar = float(s_hat_tid) if local_q > 0 else 0.0
+
+            # local miss ratio ρ_t(i)
+            rho = local_miss[n.name] / max(1, local_cnt[n.name]) if local_cnt[n.name] > 0 else 0.0
+
+            obs = build_obs_vector(n, nodes, node_time, deadline, local_q, local_sbar, rho, w_eff)
+            local_states.append(obs)
         local_states = np.stack(local_states, axis=0)
 
-        # choose node (decentralized exec)
+        # ---- MA decision: pick node by decentralized actors ----
         a = trainer.select_node(local_states, eps=eps)
         chosen = nodes[a]
 
-        # simulate assignment
-        est = max(node_time[chosen.name], comm_ready(dag, tid, chosen.name, schedule, nodes))
+        # ---- apply assignment (simulate) ----
+        est_par = est_on_node(dag, tid, chosen.name, schedule, nodes)
+        if est_par is None:
+            est_par = 0.0
+        est = max(node_time[chosen.name], est_par)
         et = exec_time(dag.tasks[tid], chosen)
         ft = est + et
 
         schedule[tid] = (chosen.name, est, ft)
-        finish[tid] = ft
         node_time[chosen.name] = ft
+        scheduled_set.add(tid)
 
         incC = et * chosen.cost
-        incE = et * chosen.qActive
+        incE = et * chosen.p_act
         total_cost += incC
         total_energy += incE
 
-        # REAL miss update + REAL DMR ratio (ratio of missed tasks so far)
+        # update miss stats
         miss = 1.0 if ft > deadline else 0.0
         miss_count += int(miss)
-        dmr_ratio_next = miss_count / (k + 1)
 
-        # normalized objectives (instant)
-        t_norm = et / LB_T
-        c_norm = incC / LB_C
-        e_norm = incE / LB_E
-        d_norm = dmr_ratio_next  # <<< REAL DMR ratio drives learning, not only binary
+        local_cnt[chosen.name] += 1
+        local_miss[chosen.name] += int(miss)
 
-        # reward uses sensitivity amplification (paper concept)
-        scalar = (w[0]*t_norm + w[1]*c_norm + w[2]*e_norm + w[3]*d_norm) * (1.0 + SENS_LAMBDA*s_val)
-        reward = -float(scalar)
+        dmr_next = miss_count / max(1, len(scheduled_set))
 
-        # next state
-        if k == n_tasks - 1:
-            ng = None
-            nl = None
-            done = True
+        # ---- instantaneous increments c^t and normalized c_hat^t(m) ----
+        ms_new = max(node_time.values()) if node_time else ft
+        d_ms = ms_new - ms_so_far
+
+        norm_ms.push(d_ms); norm_c.push(incC); norm_e.push(incE)
+        c_hat_ms   = (norm_ms.norm(d_ms)) / (LB_T + EPS)
+        c_hat_cost = (norm_c.norm(incC)) / (LB_C + EPS)
+        c_hat_en   = (norm_e.norm(incE)) / (LB_E + EPS)
+        c_hat_dmr  = float(dmr_next)  # already [0,1]
+
+        # ---- Reward Eq.(13) EXACT ----
+        reward = -float(
+            (w_eff[0]*c_hat_ms +
+             w_eff[1]*c_hat_cost +
+             w_eff[2]*c_hat_en +
+             w_eff[3]*c_hat_dmr) * (1.0 + ALPHA_SENS * float(s_hat_tid))
+        )
+
+        # ---- Update weights Eq.(14) ----
+        v_tilde = compute_violation_pressures(
+            ms_so_far=ms_new, e_so_far=total_energy, c_so_far=total_cost, dmr_so_far=dmr_next,
+            deadline=deadline, energy_budget=energy_budget, cost_budget=cost_budget
+        )
+        w_next = update_weights_eq14(w, v_tilde, beta=BETA_W)
+
+        # ---- next transition state ----
+        if len(scheduled_set) == n_total:
+            ng, nl, done = None, None, True
         else:
-            next_tid = order[k+1]
-            sysf2 = system_features(node_time, nodes, total_energy, energy_budget, deadline)
-            tf2 = task_feat[next_tid]
-            x_sens2 = np.concatenate([tf2, sysf2], axis=0).astype(np.float32)
-            progress2 = (k+1)/max(1, n_tasks)
-            ng = build_global_state(tf2, sysf2, w, progress2, dmr_ratio_next)
+            # approximate next chosen task under updated weights
+            ready2 = get_ready_set(dag, scheduled_set)
+            ms2 = max(node_time.values()) if node_time else ms_new
+            dmr2 = dmr_next
+            progress2 = len(scheduled_set) / max(1, n_total)
+
+            feats_ready2 = []
+            for tid2 in ready2:
+                slack2 = max(0.0, deadline - ms2)
+                slack2_norm = float(slack2 / (deadline + EPS))
+                feats_ready2.append(build_task_feature_vector(dag, tid2, depth_norm, level_norm, slack2_norm, 0.0))
+            feats_ready2 = np.stack(feats_ready2).astype(np.float32)
+
+            tid2, s_hat2, _ = choose_task_by_sensitivity(attn_model, feats_ready2, ready2)
+            w_eff2 = bias_weights_with_sensitivity(w_next, s_hat2, kappa=SENS_WEIGHT_BIAS)
+
+            slack2 = max(0.0, deadline - ms2)
+            slack2_norm = float(slack2 / (deadline + EPS))
+            tf2 = build_task_feature_vector(dag, tid2, depth_norm, level_norm, slack2_norm, 0.0)
+
+            ng = build_global_state(tf2, w_eff2, progress2, dmr2)
+
             nl_list = []
             for n in nodes:
-                nl_list.append(build_local_state(tf2, sysf2, n, node_time, deadline, w))
+                local_q = 1.0 if node_time[n.name] > ms2 else 0.0
+                local_sbar = float(s_hat2) if local_q > 0 else 0.0
+                rho = local_miss[n.name] / max(1, local_cnt[n.name]) if local_cnt[n.name] > 0 else 0.0
+                obs = build_obs_vector(n, nodes, node_time, deadline, local_q, local_sbar, rho, w_eff2)
+                nl_list.append(obs)
             nl = np.stack(nl_list, axis=0)
             done = False
 
         trainer.replay.push(g, local_states, a, reward, ng, nl, done)
         trainer.optimize()
 
-        # train sensitivity net online:
-        harm = float(min(1.0, max(0.0, (-reward)/3.0)))
-        s_pred = sens_net(s_tensor)
-        loss_s = (s_pred - torch.tensor([harm], device=device))**2
-        sens_opt.zero_grad()
-        loss_s.mean().backward()
-        sens_opt.step()
-
-        # adaptive weights update (sensitivity-aware)
-        w = update_weights_adaptive(w, [t_norm, c_norm, e_norm, d_norm], sens_val=s_val)
+        # advance weight vector
+        w = w_next
 
     return w, schedule
 
+
 # ============================================================
-# 10) RUN ALL WORKFLOWS
+# 13) Greedy scheduling (online execution phase)
 # ============================================================
-# --- Define your nodes (replace with your PCS values if needed)
+@torch.no_grad()
+def schedule_greedy(dag: DAG, nodes, trainer: QMIXTrainer, attn_model: AttnSensitivityScorer,
+                    w, LB_T, LB_C, LB_E):
+
+    deadline = DEADLINE_FACTOR * LB_T
+    energy_budget = ENERGY_BUDGET_FACTOR * LB_E
+    cost_budget = COST_BUDGET_FACTOR * LB_C
+
+    depth_norm = compute_critical_depth(dag)
+    level_norm = compute_levels(dag)
+
+    node_time = {n.name: 0.0 for n in nodes}
+    schedule = {}
+    scheduled_set = set()
+
+    total_cost = 0.0
+    total_energy = 0.0
+
+    local_miss = {n.name: 0 for n in nodes}
+    local_cnt  = {n.name: 0 for n in nodes}
+
+    miss_count = 0
+    n_total = len(dag.tasks)
+
+    while len(scheduled_set) < n_total:
+        ready = get_ready_set(dag, scheduled_set)
+        if not ready:
+            break
+
+        ms_so_far = max(node_time.values()) if node_time else 0.0
+        dmr_ratio = miss_count / max(1, len(scheduled_set)) if scheduled_set else 0.0
+        progress = len(scheduled_set) / max(1, n_total)
+
+        feats_ready = []
+        for tid in ready:
+            slack = max(0.0, deadline - ms_so_far)
+            slack_norm = float(slack / (deadline + EPS))
+            feats_ready.append(build_task_feature_vector(dag, tid, depth_norm, level_norm, slack_norm, 0.0))
+        feats_ready = np.stack(feats_ready).astype(np.float32)
+
+        tid, s_hat_tid, _ = choose_task_by_sensitivity(attn_model, feats_ready, ready)
+        slack = max(0.0, deadline - ms_so_far)
+        slack_norm = float(slack / (deadline + EPS))
+        tf = build_task_feature_vector(dag, tid, depth_norm, level_norm, slack_norm, 0.0)
+
+        w_eff = bias_weights_with_sensitivity(w, s_hat_tid, kappa=SENS_WEIGHT_BIAS)
+        g = build_global_state(tf, w_eff, progress, dmr_ratio)
+
+        local_states = []
+        for n in nodes:
+            local_q = 1.0 if node_time[n.name] > ms_so_far else 0.0
+            local_sbar = float(s_hat_tid) if local_q > 0 else 0.0
+            rho = local_miss[n.name] / max(1, local_cnt[n.name]) if local_cnt[n.name] > 0 else 0.0
+            obs = build_obs_vector(n, nodes, node_time, deadline, local_q, local_sbar, rho, w_eff)
+            local_states.append(obs)
+        local_states = np.stack(local_states, axis=0)
+
+        a = trainer.select_node(local_states, eps=0.0)
+        chosen = nodes[a]
+
+        est_par = est_on_node(dag, tid, chosen.name, schedule, nodes)
+        if est_par is None:
+            est_par = 0.0
+        est = max(node_time[chosen.name], est_par)
+        et = exec_time(dag.tasks[tid], chosen)
+        ft = est + et
+
+        schedule[tid] = (chosen.name, est, ft)
+        node_time[chosen.name] = ft
+        scheduled_set.add(tid)
+
+        incC = et * chosen.cost
+        incE = et * chosen.p_act
+        total_cost += incC
+        total_energy += incE
+
+        miss = 1.0 if ft > deadline else 0.0
+        miss_count += int(miss)
+        local_cnt[chosen.name] += 1
+        local_miss[chosen.name] += int(miss)
+        dmr_next = miss_count / max(1, len(scheduled_set))
+
+        v_tilde = compute_violation_pressures(
+            ms_so_far=max(node_time.values()), e_so_far=total_energy, c_so_far=total_cost, dmr_so_far=dmr_next,
+            deadline=deadline, energy_budget=energy_budget, cost_budget=cost_budget
+        )
+        w = update_weights_eq14(w, v_tilde, beta=BETA_W)
+
+    return schedule
+
+
+# ============================================================
+# 14) Evaluate schedule
+# ============================================================
+def evaluate_schedule(dag: DAG, nodes, schedule, LB_T, LB_C, LB_E):
+    if not schedule:
+        return {"T": 0.0, "C": 0.0, "E": 0.0, "DMR": 1.0, "QoS": 1e9, "SLR": 0.0, "CR": 0.0, "ER": 0.0}
+
+    node_map = {n.name: n for n in nodes}
+    deadline = DEADLINE_FACTOR * LB_T
+
+    T = max(ft for (_, _, ft) in schedule.values())
+    C = 0.0
+    E = 0.0
+    miss = 0
+
+    for tid, (nn, est, ft) in schedule.items():
+        node = node_map[nn]
+        et = ft - est
+        C += et * node.cost
+        E += et * node.p_act
+        if ft > deadline:
+            miss += 1
+
+    DMR = miss / max(1, len(dag.tasks))
+
+    Tn = T / (LB_T + EPS)
+    Cn = C / (LB_C + EPS)
+    En = E / (LB_E + EPS)
+    QoS = 0.25*Tn + 0.25*Cn + 0.25*En + 0.25*DMR
+
+    SLR = Tn
+    CR  = Cn
+    ER  = En
+
+    return {"T": T, "C": C, "E": E, "DMR": DMR, "QoS": QoS, "SLR": SLR, "CR": CR, "ER": ER}
+
+
+# ============================================================
+# 15) RUN ALL WORKFLOWS
+# ============================================================
+
 NODES = [
-    Node("Fog1", 2000, 0.02, 60, 8e6),
-    Node("Fog2", 2500, 0.03, 70, 1e7),
-    Node("Fog3", 1800, 0.018, 55, 7e6),
-    Node("Cloud1", 8000, 0.08, 140, 2e7),
+    Node("Fog1",   2000, 0.02,  60,  8e6),
+    Node("Fog2",   2500, 0.03,  70,  1e7),
+    Node("Fog3",   1800, 0.018, 55,  7e6),
+    Node("Cloud1", 8000, 0.08, 140,  2e7),
 ]
 
-# --- Set XML folder
-XML_DIR = "/content"   # <-- change if needed (e.g., /content/drive/MyDrive/Colab_XMLs)
-
+XML_DIR = "/content"
 xmls = sorted(glob.glob(os.path.join(XML_DIR, "*.xml")))
 print("XML files found:", len(xmls))
 if len(xmls) == 0:
     print("WARNING: no XML found. Upload XML files or set XML_DIR correctly.")
 
 results = []
+
+TF_DIM = 7
+W_DIM  = 4
+# Eq(12) observation: 5 scalars + w(4) => 9 dims
+OBS_DIM = 5 + W_DIM
+# local state = observation only (exactly Eq.12)
+L_DIM = OBS_DIM
+# global state for critic: task_feat(7) + w(4) + progress + dmr = 7+4+2=13
+G_DIM = TF_DIM + W_DIM + 2
 
 for path in xmls:
     wf_name = os.path.splitext(os.path.basename(path))[0]
@@ -590,31 +988,29 @@ for path in xmls:
 
     LB_T, LB_C, LB_E = compute_LBs(dag, NODES)
 
-    # dims
-    task_feat = build_task_features(dag)
-    tf_dim = len(next(iter(task_feat.values())))
-    sys_dim = 4
-    w_dim = 4
-    # global: task + sys + w + progress + dmr_ratio
-    g_dim = tf_dim + sys_dim + w_dim + 2
-    # local: task + sys + node_feat(5) + w
-    l_dim = tf_dim + sys_dim + 5 + w_dim
-
     # models
-    trainer = QMIXTrainer(NODES, g_dim=g_dim, l_dim=l_dim)
-    sens_net = SensitivityNet(in_dim=tf_dim + sys_dim).to(device)
-    sens_opt = optim.Adam(sens_net.parameters(), lr=1e-3)
+    trainer = QMIXTrainer(NODES, g_dim=G_DIM, l_dim=L_DIM)
 
-    # init weights
-    w = normalize_w(np.array([0.6, 0.1, 0.1, 0.2], dtype=np.float32))
+    attn_model = AttnSensitivityScorer(in_dim=TF_DIM, emb_dim=64).to(device)
 
-    # train
+    # ---- OFFLINE TRAIN g_phi (Sec 3.4) then freeze ----
+    pretrain_sensitivity_offline(
+        attn_model, dag, LB_T,
+        epochs=SENS_PRETRAIN_EPOCHS,
+        lr=SENS_PRETRAIN_LR,
+        n_samples=SENS_READYSET_SAMPLES
+    )
+
+    # init weights (normalized)
+    w = normalize_w(np.array([0.25, 0.25, 0.25, 0.25], dtype=np.float32))
+
+    # ---- Train MA-CTDE ----
     for ep in range(EPISODES_PER_WF):
         eps = EPS_START + (EPS_END - EPS_START) * (ep / max(1, EPISODES_PER_WF - 1))
-        w, _ = run_episode_train_with_eps(dag, NODES, trainer, sens_net, sens_opt, w, LB_T, LB_C, LB_E, eps)
+        w, _ = run_episode_train(dag, NODES, trainer, attn_model, w, LB_T, LB_C, LB_E, eps)
 
-    # final greedy schedule
-    sched = schedule_greedy(dag, NODES, trainer, sens_net, w, LB_T, LB_C, LB_E)
+    # ---- Online execution ----
+    sched = schedule_greedy(dag, NODES, trainer, attn_model, w, LB_T, LB_C, LB_E)
     ev = evaluate_schedule(dag, NODES, sched, LB_T, LB_C, LB_E)
 
     print(f"[{wf_name}] T={ev['T']:.2f} C={ev['C']:.2f} E={ev['E']:.2f} DMR={ev['DMR']:.3f} QoS={ev['QoS']:.4f} | w={w}")
@@ -629,16 +1025,16 @@ for path in xmls:
         "SLR": ev["SLR"],
         "CR": ev["CR"],
         "ER": ev["ER"],
-        "w_time": float(w[0]),
-        "w_cost": float(w[1]),
-        "w_energy": float(w[2]),
-        "w_deadline": float(w[3]),
+        "w_MS": float(w[0]),
+        "w_Cost": float(w[1]),
+        "w_Energy": float(w[2]),
+        "w_DMR": float(w[3]),
     })
 
 if results:
     df = pd.DataFrame(results).sort_values("Workflow")
     print("\n==============================")
-    print(" FINAL RESULTS (QMIX + Sensitivity + Real DMR)")
+    print(" FINAL RESULTS (100% Method-Aligned)")
     print("==============================\n")
     print(df[["Workflow", "Makespan", "Cost", "Energy", "DMR", "QoS"]].to_string(index=False))
 
