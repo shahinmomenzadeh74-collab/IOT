@@ -10,6 +10,7 @@
 # - Sensitivity used for BOTH: priority queue AND biasing objective weights (per text)
 # ============================================================
 
+import argparse
 import os, glob, random
 import numpy as np
 import pandas as pd
@@ -19,6 +20,7 @@ import torch.optim as optim
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from collections import deque, namedtuple
+from pathlib import Path
 
 # -------------------- Reproducibility --------------------
 SEED = 0
@@ -26,7 +28,16 @@ random.seed(SEED)
 np.random.seed(SEED)
 torch.manual_seed(SEED)
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+def select_device(mode: str):
+    if mode == "cpu":
+        return torch.device("cpu")
+    if mode == "cuda":
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+device = select_device("auto")
 print("Device:", device)
 
 # ============================================================
@@ -954,21 +965,12 @@ def evaluate_schedule(dag: DAG, nodes, schedule, LB_T, LB_C, LB_E):
 # ============================================================
 # 15) RUN ALL WORKFLOWS
 # ============================================================
-
 NODES = [
     Node("Fog1",   2000, 0.02,  60,  8e6),
     Node("Fog2",   2500, 0.03,  70,  1e7),
     Node("Fog3",   1800, 0.018, 55,  7e6),
     Node("Cloud1", 8000, 0.08, 140,  2e7),
 ]
-
-XML_DIR = "/content"
-xmls = sorted(glob.glob(os.path.join(XML_DIR, "*.xml")))
-print("XML files found:", len(xmls))
-if len(xmls) == 0:
-    print("WARNING: no XML found. Upload XML files or set XML_DIR correctly.")
-
-results = []
 
 TF_DIM = 7
 W_DIM  = 4
@@ -979,65 +981,121 @@ L_DIM = OBS_DIM
 # global state for critic: task_feat(7) + w(4) + progress + dmr = 7+4+2=13
 G_DIM = TF_DIM + W_DIM + 2
 
-for path in xmls:
-    wf_name = os.path.splitext(os.path.basename(path))[0]
-    dag = parse_dax(path)
-    if dag is None or not dag.tasks:
-        print("Skipping invalid:", wf_name)
-        continue
 
-    LB_T, LB_C, LB_E = compute_LBs(dag, NODES)
+def run_all_workflows(xml_dir: Path,
+                      episodes_per_wf: int | None = None,
+                      sens_epochs: int | None = None,
+                      sens_samples: int | None = None):
+    episodes = EPISODES_PER_WF if episodes_per_wf is None else episodes_per_wf
+    se = SENS_PRETRAIN_EPOCHS if sens_epochs is None else sens_epochs
+    ss = SENS_READYSET_SAMPLES if sens_samples is None else sens_samples
 
-    # models
-    trainer = QMIXTrainer(NODES, g_dim=G_DIM, l_dim=L_DIM)
+    xml_dir = Path(xml_dir)
+    xmls = sorted(xml_dir.glob("*.xml"))
+    print("XML files found:", len(xmls))
+    if len(xmls) == 0:
+        print("WARNING: no XML found. Provide XML workflows via --xml-dir.")
+        return []
 
-    attn_model = AttnSensitivityScorer(in_dim=TF_DIM, emb_dim=64).to(device)
+    results = []
 
-    # ---- OFFLINE TRAIN g_phi (Sec 3.4) then freeze ----
-    pretrain_sensitivity_offline(
-        attn_model, dag, LB_T,
-        epochs=SENS_PRETRAIN_EPOCHS,
-        lr=SENS_PRETRAIN_LR,
-        n_samples=SENS_READYSET_SAMPLES
-    )
+    for path in xmls:
+        wf_name = path.stem
+        dag = parse_dax(str(path))
+        if dag is None or not dag.tasks:
+            print("Skipping invalid:", wf_name)
+            continue
 
-    # init weights (normalized)
-    w = normalize_w(np.array([0.25, 0.25, 0.25, 0.25], dtype=np.float32))
+        LB_T, LB_C, LB_E = compute_LBs(dag, NODES)
 
-    # ---- Train MA-CTDE ----
-    for ep in range(EPISODES_PER_WF):
-        eps = EPS_START + (EPS_END - EPS_START) * (ep / max(1, EPISODES_PER_WF - 1))
-        w, _ = run_episode_train(dag, NODES, trainer, attn_model, w, LB_T, LB_C, LB_E, eps)
+        # models
+        trainer = QMIXTrainer(NODES, g_dim=G_DIM, l_dim=L_DIM)
 
-    # ---- Online execution ----
-    sched = schedule_greedy(dag, NODES, trainer, attn_model, w, LB_T, LB_C, LB_E)
-    ev = evaluate_schedule(dag, NODES, sched, LB_T, LB_C, LB_E)
+        attn_model = AttnSensitivityScorer(in_dim=TF_DIM, emb_dim=64).to(device)
 
-    print(f"[{wf_name}] T={ev['T']:.2f} C={ev['C']:.2f} E={ev['E']:.2f} DMR={ev['DMR']:.3f} QoS={ev['QoS']:.4f} | w={w}")
+        # ---- OFFLINE TRAIN g_phi (Sec 3.4) then freeze ----
+        pretrain_sensitivity_offline(
+            attn_model, dag, LB_T,
+            epochs=se,
+            lr=SENS_PRETRAIN_LR,
+            n_samples=ss
+        )
 
-    results.append({
-        "Workflow": wf_name,
-        "Makespan": ev["T"],
-        "Cost": ev["C"],
-        "Energy": ev["E"],
-        "DMR": ev["DMR"],
-        "QoS": ev["QoS"],
-        "SLR": ev["SLR"],
-        "CR": ev["CR"],
-        "ER": ev["ER"],
-        "w_MS": float(w[0]),
-        "w_Cost": float(w[1]),
-        "w_Energy": float(w[2]),
-        "w_DMR": float(w[3]),
-    })
+        # init weights (normalized)
+        w = normalize_w(np.array([0.25, 0.25, 0.25, 0.25], dtype=np.float32))
 
-if results:
-    df = pd.DataFrame(results).sort_values("Workflow")
-    print("\n==============================")
-    print(" FINAL RESULTS (100% Method-Aligned)")
-    print("==============================\n")
-    print(df[["Workflow", "Makespan", "Cost", "Energy", "DMR", "QoS"]].to_string(index=False))
+        # ---- Train MA-CTDE ----
+        for ep in range(episodes):
+            eps = EPS_START + (EPS_END - EPS_START) * (ep / max(1, episodes - 1))
+            w, _ = run_episode_train(dag, NODES, trainer, attn_model, w, LB_T, LB_C, LB_E, eps)
 
-    print("\n=== Averages ===")
-    for col in ["Makespan", "Cost", "Energy", "DMR", "QoS", "SLR", "CR", "ER"]:
-        print(f"{col}: {df[col].mean():.4f}")
+        # ---- Online execution ----
+        sched = schedule_greedy(dag, NODES, trainer, attn_model, w, LB_T, LB_C, LB_E)
+        ev = evaluate_schedule(dag, NODES, sched, LB_T, LB_C, LB_E)
+
+        print(f"[{wf_name}] T={ev['T']:.2f} C={ev['C']:.2f} E={ev['E']:.2f} DMR={ev['DMR']:.3f} QoS={ev['QoS']:.4f} | w={w}")
+
+        results.append({
+            "Workflow": wf_name,
+            "Makespan": ev["T"],
+            "Cost": ev["C"],
+            "Energy": ev["E"],
+            "DMR": ev["DMR"],
+            "QoS": ev["QoS"],
+            "SLR": ev["SLR"],
+            "CR": ev["CR"],
+            "ER": ev["ER"],
+            "w_MS": float(w[0]),
+            "w_Cost": float(w[1]),
+            "w_Energy": float(w[2]),
+            "w_DMR": float(w[3]),
+        })
+
+    if results:
+        df = pd.DataFrame(results).sort_values("Workflow")
+        print("\n==============================")
+        print(" FINAL RESULTS (100% Method-Aligned)")
+        print("==============================\n")
+        print(df[["Workflow", "Makespan", "Cost", "Energy", "DMR", "QoS"]].to_string(index=False))
+
+        print("\n=== Averages ===")
+        for col in ["Makespan", "Cost", "Energy", "DMR", "QoS", "SLR", "CR", "ER"]:
+            print(f"{col}: {df[col].mean():.4f}")
+
+    return results
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Run MA-DRL workflow scheduler with sensitivity model")
+    parser.add_argument("--xml-dir", type=str, default=None, help="Directory containing workflow XML files")
+    parser.add_argument("--episodes", type=int, default=None, help="Episodes per workflow during training")
+    parser.add_argument("--sens-epochs", type=int, default=None, help="Offline sensitivity pretrain epochs")
+    parser.add_argument("--sens-readyset-samples", type=int, default=None,
+                        help="Ready-set samples per workflow for sensitivity pretraining")
+    parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto", help="Device override")
+    parser.add_argument("--save-csv", type=str, default=None, help="Optional path to save aggregated results")
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+
+    # resolve device
+    global device
+    device = select_device(args.device)
+    print("Device:", device)
+
+    xml_dir = Path(args.xml_dir) if args.xml_dir else Path(__file__).resolve().parent
+    results = run_all_workflows(xml_dir, episodes_per_wf=args.episodes,
+                                sens_epochs=args.sens_epochs, sens_samples=args.sens_readyset_samples)
+
+    if args.save_csv and results:
+        df = pd.DataFrame(results).sort_values("Workflow")
+        out_path = Path(args.save_csv)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        df.to_csv(out_path, index=False)
+        print(f"Saved results to {out_path}")
+
+
+if __name__ == "__main__":
+    main()
